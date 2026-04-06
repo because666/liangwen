@@ -1,306 +1,285 @@
 """
-优化版预测器 - 针对收益率优化
+高频量化预测类
 
-改进点：
-1. 降低"不变"预测比例，增加交易次数
-2. 置信度阈值动态调整
-3. 强制最小交易比例
+按照竞赛规范实现 Predictor 类
 """
 
-from __future__ import annotations
-
-import os
-import sys
-import json
-import glob
-import numpy as np
+from typing import List
 import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 500, dropout: float = 0.1):
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation Block"""
+    
+    def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        import math
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+        self.squeeze = nn.AdaptiveAvgPool1d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
     
     def forward(self, x):
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
+        b, c, _ = x.size()
+        y = self.squeeze(x).view(b, c)
+        y = self.excitation(y).view(b, c, 1)
+        return x * y
 
 
 class TemporalBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, stride=1, dilation=1, dropout=0.2):
+    """扩张因果卷积块"""
+    
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, 
+                 dilation: int, dropout: float = 0.1):
         super().__init__()
-        padding = (kernel_size - 1) * dilation
-        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, stride=stride, padding=padding, dilation=dilation)
-        self.bn1 = nn.BatchNorm1d(out_ch)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, stride=stride, padding=padding, dilation=dilation)
-        self.bn2 = nn.BatchNorm1d(out_ch)
-        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-        self.relu = nn.ReLU()
+        self.conv1 = nn.Conv1d(
+            in_channels, out_channels, kernel_size,
+            padding=(kernel_size - 1) * dilation, dilation=dilation
+        )
+        self.conv2 = nn.Conv1d(
+            out_channels, out_channels, kernel_size,
+            padding=(kernel_size - 1) * dilation, dilation=dilation
+        )
+        self.norm1 = nn.LayerNorm(out_channels)
+        self.norm2 = nn.LayerNorm(out_channels)
         self.dropout = nn.Dropout(dropout)
-        self.padding = padding
+        self.se = SEBlock(out_channels)
+        self.residual = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
     
     def forward(self, x):
-        residual = x
-        out = self.conv1(x)[:, :, :-self.padding] if self.padding > 0 else self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.dropout(out)
-        out = self.conv2(out)[:, :, :-self.padding] if self.padding > 0 else self.conv2(out)
-        out = self.bn2(out)
-        if self.downsample:
-            residual = self.downsample(residual)
-        out = out + residual
-        return self.relu(out)
-
-
-class TCN(nn.Module):
-    def __init__(self, in_channels, hidden_channels=[64, 128], kernel_size=3, dropout=0.2):
-        super().__init__()
-        layers = []
-        for i in range(len(hidden_channels)):
-            dilation = 2 ** i
-            in_c = in_channels if i == 0 else hidden_channels[i - 1]
-            out_c = hidden_channels[i]
-            layers.append(TemporalBlock(in_c, out_c, kernel_size, dilation=dilation, dropout=dropout))
-        self.network = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.network(x)
-
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, d_model, nhead=4, num_layers=2, dropout=0.1):
-        super().__init__()
-        self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-    
-    def forward(self, x):
-        x = self.pos_encoder(x)
-        return self.transformer(x)
-
-
-class AttentionPooling(nn.Module):
-    def __init__(self, d_model, num_heads=4):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-        self.query = nn.Parameter(torch.randn(1, 1, d_model))
-    
-    def forward(self, x):
-        batch_size = x.size(0)
-        query = self.query.expand(batch_size, -1, -1)
-        attn_output, _ = self.attention(query, x, x)
-        return attn_output.squeeze(1)
-
-
-class HFTPredictor(nn.Module):
-    def __init__(self, num_features, num_classes_per_head=[3, 3, 3, 3, 3], hidden_dim=128, dropout=0.3):
-        super().__init__()
-        self.num_classes_per_head = num_classes_per_head
+        residual = self.residual(x)
         
-        self.feature_embed = nn.Sequential(
+        out = self.conv1(x)[:, :, :x.size(2)]
+        out = self.norm1(out.transpose(1, 2)).transpose(1, 2)
+        out = F.gelu(out)
+        out = self.dropout(out)
+        
+        out = self.conv2(out)[:, :, :x.size(2)]
+        out = self.norm2(out.transpose(1, 2)).transpose(1, 2)
+        out = F.gelu(out)
+        out = self.dropout(out)
+        
+        out = self.se(out)
+        
+        return F.gelu(out + residual)
+
+
+class LargeTCN(nn.Module):
+    """大规模TCN"""
+    
+    def __init__(self, in_channels: int, hidden_channels: int = 384, num_layers: int = 6, dropout: float = 0.1):
+        super().__init__()
+        self.input_proj = nn.Conv1d(in_channels, hidden_channels, 1)
+        
+        self.blocks = nn.ModuleList()
+        for i in range(num_layers):
+            dilation = 2 ** (i % 4)
+            self.blocks.append(TemporalBlock(hidden_channels, hidden_channels, 3, dilation, dropout))
+    
+    def forward(self, x):
+        x = self.input_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Transformer块"""
+    
+    def __init__(self, d_model: int, num_heads: int = 8, dim_feedforward: int = 1536, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x):
+        attn_out, _ = self.self_attn(x, x, x)
+        x = self.norm1(x + self.dropout(attn_out))
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+
+class MultiScalePooling(nn.Module):
+    """多尺度池化"""
+    
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.pools = nn.ModuleList([
+            nn.AdaptiveAvgPool1d(1),
+            nn.AdaptiveMaxPool1d(1),
+        ])
+        self.fc = nn.Linear(hidden_dim * 2, hidden_dim)
+    
+    def forward(self, x):
+        pooled = [pool(x).squeeze(-1) for pool in self.pools]
+        out = torch.cat(pooled, dim=-1)
+        return self.fc(out)
+
+
+class HFTModelLarge(nn.Module):
+    """大规模高频交易模型"""
+    
+    def __init__(self, num_features: int, hidden_dim: int = 384, num_tcn_layers: int = 6,
+                 num_transformer_layers: int = 4, num_heads: int = 8, dropout: float = 0.12):
+        super().__init__()
+        
+        self.input_embed = nn.Sequential(
             nn.Linear(num_features, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout)
         )
         
-        self.tcn = TCN(hidden_dim, [64, 128, 128], kernel_size=3, dropout=dropout)
-        self.transformer = TransformerEncoder(d_model=128, nhead=4, num_layers=2, dropout=dropout)
-        self.attention_pool = AttentionPooling(128, num_heads=4)
+        self.tcn = LargeTCN(hidden_dim, hidden_dim, num_tcn_layers, dropout)
+        
+        self.transformer_layers = nn.ModuleList([
+            TransformerBlock(hidden_dim, num_heads, hidden_dim * 4, dropout)
+            for _ in range(num_transformer_layers)
+        ])
+        
+        self.multi_scale_pool = MultiScalePooling(hidden_dim)
         
         self.shared_fc = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout / 2)
         )
         
         self.heads = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(128, 64),
-                nn.ReLU(),
+                nn.Linear(hidden_dim, 128),
+                nn.LayerNorm(128),
+                nn.GELU(),
                 nn.Dropout(dropout / 2),
-                nn.Linear(64, num_classes)
-            ) for num_classes in num_classes_per_head
+                nn.Linear(128, 64),
+                nn.LayerNorm(64),
+                nn.GELU(),
+                nn.Dropout(dropout / 3),
+                nn.Linear(64, 3)
+            ) for _ in range(5)
         ])
     
     def forward(self, x):
-        if x.dim() == 4:
-            x = x.squeeze(1)
-        x = self.feature_embed(x)
+        x = self.input_embed(x)
+        
         x = x.transpose(1, 2)
         x = self.tcn(x)
+        
         x = x.transpose(1, 2)
-        x = self.transformer(x)
-        x = self.attention_pool(x)
+        for layer in self.transformer_layers:
+            x = layer(x)
+        
+        x = x.transpose(1, 2)
+        x = self.multi_scale_pool(x)
+        
         x = self.shared_fc(x)
+        
         return tuple(head(x) for head in self.heads)
 
 
 class Predictor:
-    """优化版集成预测器 - 针对收益率优化"""
+    """预测类"""
     
-    def __init__(self) -> None:
-        current_dir = os.path.dirname(__file__)
+    def __init__(self):
+        import json
+        import os
         
-        config_path = os.path.join(current_dir, "config.json")
-        with open(config_path, "r", encoding="utf-8") as f:
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(current_dir, 'config.json')
+        model_path = os.path.join(current_dir, 'best_model.pt')
+        
+        with open(config_path, 'r') as f:
             self.config = json.load(f)
         
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.feature_cols = self.config.get("feature", [])
+        checkpoint = torch.load(model_path, map_location=self.device)
         
-        self.models = []
-        self.weights = []
-        self._load_ensemble_models(current_dir)
+        self.feature_cols = checkpoint.get('feature_cols', self.config['feature'])
+        self.hidden_dim = checkpoint.get('hidden_dim', 384)
+        self.thresholds = checkpoint.get('thresholds', {})
         
-        # 关键参数：降低"不变"预测比例
-        self.neutral_threshold = 0.50  # 只有置信度>50%才预测"不变"
-        self.min_trade_ratio = 0.4     # 至少40%的交易比例
+        self.model = HFTModelLarge(
+            num_features=len(self.feature_cols),
+            hidden_dim=self.hidden_dim,
+            num_tcn_layers=6,
+            num_transformer_layers=4,
+            num_heads=8,
+            dropout=0.12
+        ).to(self.device)
         
-        print(f"集成模型数量: {len(self.models)}")
-        print(f"中性阈值: {self.neutral_threshold}")
-        print(f"最小交易比例: {self.min_trade_ratio}")
-    
-    def _load_ensemble_models(self, current_dir: str) -> None:
-        model_files = sorted(glob.glob(os.path.join(current_dir, "model_seed*.pt")))
-        
-        if not model_files:
-            raise FileNotFoundError("未找到模型文件 model_seed*.pt")
-        
-        # 等权重
-        self.weights = [1.0 / len(model_files)] * len(model_files)
-        
-        for model_file in model_files:
-            try:
-                checkpoint = torch.load(model_file, map_location=self.device, weights_only=False)
-                
-                model = HFTPredictor(
-                    num_features=len(self.feature_cols),
-                    num_classes_per_head=[3, 3, 3, 3, 3],
-                    hidden_dim=128,
-                    dropout=0.3
-                )
-                
-                model.load_state_dict(checkpoint, strict=False)
-                model.to(self.device)
-                model.eval()
-                self.models.append(model)
-                print(f"加载模型: {os.path.basename(model_file)}")
-            except Exception as e:
-                print(f"加载模型失败 {model_file}: {e}")
+        self.model.load_state_dict(checkpoint['model_state'])
+        self.model.eval()
     
     def predict(self, x: List[pd.DataFrame]) -> List[List[int]]:
-        arrs = []
+        """
+        预测函数
+        
+        输入: List[pd.DataFrame]，长度为batch
+              每个DataFrame为100个tick的数据，列名为feature
+        输出: List[List[int]]，长度为batch
+              每个内层List长度为label个数，值为0/1/2
+        """
+        batch_size = len(x)
+        
+        features = []
         for df in x:
-            # 创建新DataFrame避免修改原数据
-            df_copy = df.copy()
             for col in self.feature_cols:
-                if col not in df_copy.columns:
-                    df_copy[col] = 0.0
-            arr = df_copy[self.feature_cols].to_numpy(dtype=np.float32, copy=False)
-            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-            arrs.append(arr)
+                if col not in df.columns:
+                    df[col] = 0
+            
+            feature_data = df[self.feature_cols].values.astype(np.float32)
+            
+            feature_data = np.nan_to_num(feature_data, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            features.append(feature_data)
         
-        x_np = np.ascontiguousarray(np.stack(arrs, axis=0))
-        x_tensor = torch.from_numpy(x_np).to(self.device, dtype=torch.float32)
+        features = np.array(features, dtype=np.float32)
         
-        all_probs = []
+        features_tensor = torch.from_numpy(features).to(self.device)
         
         with torch.no_grad():
-            for model in self.models:
-                outputs = model(x_tensor)
-                probs = [F.softmax(o, dim=1) for o in outputs]
-                all_probs.append(probs)
-        
-        # 加权平均
-        num_heads = len(all_probs[0])
-        ensemble_probs = []
-        for head_idx in range(num_heads):
-            head_probs = torch.zeros_like(all_probs[0][head_idx])
-            for model_idx, probs in enumerate(all_probs):
-                head_probs += self.weights[model_idx] * probs[head_idx]
-            ensemble_probs.append(head_probs)
-        
-        # 预测 - 优化策略
-        predictions = []
-        for b in range(ensemble_probs[0].size(0)):
-            sample_preds = []
-            sample_probs = []
+            outputs = self.model(features_tensor)
             
-            for head_idx, prob in enumerate(ensemble_probs):
-                p = prob[b].cpu().numpy()
+            predictions = []
+            for i, output in enumerate(outputs):
+                probs = F.softmax(output, dim=1)
+                max_probs, preds = probs.max(dim=1)
                 
-                # 策略1：只有当"不变"置信度足够高时才预测不变
-                if p[1] > self.neutral_threshold:
-                    pred = 1  # 不变
-                elif p[0] > p[2]:
-                    pred = 0  # 下跌
-                else:
-                    pred = 2  # 上涨
+                threshold = self.thresholds.get(str(i), 0.55)
                 
-                sample_preds.append(pred)
-                sample_probs.append(p)
-            
-            # 策略2：强制最小交易比例
-            trade_count = sum(1 for p in sample_preds if p != 1)
-            trade_ratio = trade_count / len(sample_preds)
-            
-            if trade_ratio < self.min_trade_ratio:
-                # 需要将一些"不变"改为涨跌
-                for i in range(len(sample_preds)):
-                    if sample_preds[i] == 1:
-                        p = sample_probs[i]
-                        # 根据涨跌概率的相对大小决定
-                        if p[0] > p[2]:
-                            sample_preds[i] = 0
-                        else:
-                            sample_preds[i] = 2
-                        
-                        # 检查是否达到最小交易比例
-                        trade_count = sum(1 for p in sample_preds if p != 1)
-                        if trade_count / len(sample_preds) >= self.min_trade_ratio:
-                            break
-            
-            predictions.append(sample_preds)
+                for j in range(batch_size):
+                    if max_probs[j].item() < threshold:
+                        preds[j] = 1
+                
+                predictions.append(preds.cpu().numpy())
         
-        return predictions
-
-
-if __name__ == "__main__":
-    predictor = Predictor()
-    
-    np.random.seed(42)
-    test_data = [pd.DataFrame(np.random.randn(100, 35)) for _ in range(4)]
-    
-    results = predictor.predict(test_data)
-    
-    print(f"\n输入批次数: {len(test_data)}")
-    print(f"预测结果形状: {len(results)} x {len(results[0])}")
-    print(f"预测结果示例:")
-    for i, result in enumerate(results):
-        labels = ["label_5", "label_10", "label_20", "label_40", "label_60"]
-        directions = ["下跌", "不变", "上涨"]
-        print(f"  样本{i+1}: {dict(zip(labels, [directions[r] for r in result]))}")
+        results = []
+        for i in range(batch_size):
+            sample_preds = [int(predictions[j][i]) for j in range(5)]
+            results.append(sample_preds)
+        
+        return results

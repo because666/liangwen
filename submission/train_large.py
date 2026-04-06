@@ -688,9 +688,9 @@ def main():
     parser = argparse.ArgumentParser(description="高频量化预测模型 - 大规模版")
     parser.add_argument('--data_dir', type=str, default='./data')
     parser.add_argument('--output_dir', type=str, default='./output_large')
-    parser.add_argument('--epochs', type=int, default=80)
+    parser.add_argument('--epochs', type=int, default=100)  # 增加轮数
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--lr', type=float, default=1.5e-4)
+    parser.add_argument('--lr', type=float, default=1.0e-4)  # 降低学习率
     parser.add_argument('--hidden_dim', type=int, default=384)
     parser.add_argument('--num_tcn_layers', type=int, default=6)
     parser.add_argument('--num_transformer_layers', type=int, default=4)
@@ -751,15 +751,17 @@ def main():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     
+    # 使用更保守的OneCycleLR设置
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=args.lr * 5, epochs=args.epochs, 
-        steps_per_epoch=len(train_loader), pct_start=0.05, anneal_strategy='cos'
+        optimizer, max_lr=args.lr * 3, epochs=args.epochs, 
+        steps_per_epoch=len(train_loader), pct_start=0.1, anneal_strategy='cos',
+        div_factor=25, final_div_factor=1000  # 更平缓的学习率变化
     )
     
     scaler = torch.cuda.amp.GradScaler()
     
     best_profit, best_state, best_thresholds, best_epoch = -float('inf'), None, {}, 0
-    patience_counter, patience = 0, 15
+    patience_counter, patience = 0, 25  # 增加耐心值到25轮，给模型更多学习时间
     start_epoch = 0
     
     if args.resume:
