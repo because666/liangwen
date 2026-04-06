@@ -473,25 +473,6 @@ class AsymmetricFocalLoss(nn.Module):
         return focal_loss.mean()
 
 
-class ProfitLoss(nn.Module):
-    """收益导向损失"""
-    def __init__(self, fee_rate=FEE_RATE, profit_weight=2.0, penalty_weight=3.0, hold_weight=0.05):
-        super().__init__()
-        weight_matrix = torch.tensor([
-            [profit_weight, hold_weight, -penalty_weight],
-            [-penalty_weight/2, hold_weight, -penalty_weight/2],
-            [-penalty_weight, hold_weight, profit_weight]
-        ])
-        self.register_buffer('weight_matrix', weight_matrix)
-    
-    def forward(self, inputs, targets):
-        probs = F.softmax(inputs, dim=1)
-        weight_matrix = self.weight_matrix.to(inputs.device)
-        target_weights = weight_matrix[targets]
-        expected_profit = (probs * target_weights).sum(dim=1)
-        return -expected_profit.mean()
-
-
 def train_one_epoch(model, loader, criteria, optimizer, device, clip_norm=1.0):
     model.train()
     total_loss = 0
@@ -541,7 +522,7 @@ def validate(model, loader, device):
         for i in range(5):
             probs = F.softmax(outputs[i], dim=1)
             all_probs[i].append(probs.cpu())
-            all_targets[i].append(targets[:, i])
+            all_targets[i].append(targets[:, i].cpu())
     
     return [torch.cat(p) for p in all_probs], [torch.cat(t) for t in all_targets]
 
@@ -601,14 +582,6 @@ def save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, best_pr
                     best_state, best_thresholds, best_epoch, patience_counter, args, feature_cols):
     """
     保存训练检查点
-    
-    包含：
-    - 模型状态
-    - 优化器状态
-    - 学习率调度器状态
-    - 当前epoch
-    - 最佳指标
-    - 训练参数
     """
     checkpoint = {
         'epoch': epoch,
@@ -625,38 +598,6 @@ def save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, best_pr
         'feature_cols': feature_cols,
     }
     torch.save(checkpoint, checkpoint_path)
-    print(f"  💾 Checkpoint saved: {checkpoint_path}")
-
-
-def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
-    """
-    加载训练检查点
-    
-    返回：
-    - start_epoch: 从哪个epoch继续训练
-    - best_profit: 最佳收益
-    - best_state: 最佳模型状态
-    - best_thresholds: 最佳阈值
-    - best_epoch: 最佳epoch
-    - patience_counter: 早停计数器
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    start_epoch = checkpoint['epoch'] + 1
-    best_profit = checkpoint['best_profit']
-    best_state = checkpoint['best_state']
-    best_thresholds = checkpoint['best_thresholds']
-    best_epoch = checkpoint['best_epoch']
-    patience_counter = checkpoint['patience_counter']
-    
-    print(f"✅ Checkpoint loaded from epoch {checkpoint['epoch']}")
-    print(f"   Best profit: {best_profit:.6f} (Epoch {best_epoch})")
-    
-    return start_epoch, best_profit, best_state, best_thresholds, best_epoch, patience_counter
 
 
 def main():
@@ -723,7 +664,6 @@ def main():
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
     
     criteria = [AsymmetricFocalLoss() for _ in range(5)]
-    profit_criteria = ProfitLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
@@ -736,8 +676,18 @@ def main():
     if args.resume:
         checkpoint_path = args.checkpoint_path or os.path.join(args.output_dir, 'latest_checkpoint.pt')
         if os.path.exists(checkpoint_path):
-            start_epoch, best_profit, best_state, best_thresholds, best_epoch, patience_counter = \
-                load_checkpoint(checkpoint_path, model, optimizer, scheduler, device)
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_profit = checkpoint['best_profit']
+            best_state = checkpoint['best_state']
+            best_thresholds = checkpoint['best_thresholds']
+            best_epoch = checkpoint['best_epoch']
+            patience_counter = checkpoint['patience_counter']
+            print(f"✅ Checkpoint loaded from epoch {checkpoint['epoch']}")
+            print(f"   Best profit: {best_profit:.6f} (Epoch {best_epoch})")
             print(f"   Resuming from epoch {start_epoch}")
         else:
             print(f"⚠️  Checkpoint not found: {checkpoint_path}")
@@ -745,15 +695,15 @@ def main():
     
     print("\n开始训练...")
     print("=" * 70)
+    print("策略：全程使用 AsymmetricFocalLoss，通过阈值优化收益")
+    print("=" * 70)
     
     for epoch in range(start_epoch, args.epochs):
         print(f"\n{'='*60}\nEpoch {epoch+1}/{args.epochs} | LR: {optimizer.param_groups[0]['lr']:.2e}\n{'='*60}")
         
-        crit = [profit_criteria]*5 if epoch >= 30 else criteria
-        loss_name = "Profit" if epoch >= 30 else "AsymFocal"
-        
-        train_loss, accs = train_one_epoch(model, train_loader, crit, optimizer, device)
-        print(f"[{loss_name}] Train Loss: {train_loss:.4f} | Avg Acc: {np.mean(accs):.4f}")
+        # 全程使用 AsymmetricFocalLoss，不再切换
+        train_loss, accs = train_one_epoch(model, train_loader, criteria, optimizer, device)
+        print(f"[AsymFocal] Train Loss: {train_loss:.4f} | Avg Acc: {np.mean(accs):.4f}")
         
         probs, targets = validate(model, val_loader, device)
         
@@ -782,7 +732,6 @@ def main():
             print(f"  ⚠ No improvement ({patience_counter}/{patience})")
             if patience_counter >= patience:
                 print(f"\nEarly stopped at epoch {epoch+1}")
-                # 保存最终checkpoint
                 save_checkpoint(
                     os.path.join(args.output_dir, 'latest_checkpoint.pt'),
                     model, optimizer, scheduler, epoch, best_profit, 
@@ -792,7 +741,6 @@ def main():
         
         scheduler.step()
         
-        # 每轮保存checkpoint（用于断点续训）
         save_checkpoint(
             os.path.join(args.output_dir, 'latest_checkpoint.pt'),
             model, optimizer, scheduler, epoch, best_profit, 
