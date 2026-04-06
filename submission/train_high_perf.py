@@ -486,7 +486,8 @@ class ProfitLoss(nn.Module):
     
     def forward(self, inputs, targets):
         probs = F.softmax(inputs, dim=1)
-        target_weights = self.weight_matrix[targets]
+        weight_matrix = self.weight_matrix.to(inputs.device)
+        target_weights = weight_matrix[targets]
         expected_profit = (probs * target_weights).sum(dim=1)
         return -expected_profit.mean()
 
@@ -496,6 +497,7 @@ def train_one_epoch(model, loader, criteria, optimizer, device, clip_norm=1.0):
     total_loss = 0
     correct = [0] * 5
     total = 0
+    valid_batches = 0
     
     pbar = tqdm(loader, desc="训练", leave=False)
     for inputs, targets in pbar:
@@ -505,7 +507,9 @@ def train_one_epoch(model, loader, criteria, optimizer, device, clip_norm=1.0):
         outputs = model(inputs)
         loss = sum(criteria[i](outputs[i], targets[:, i]) for i in range(5)) / 5
         
-        if torch.isnan(loss) or torch.isinf(loss) or loss.item() < 1e-8:
+        # 修复：ProfitLoss返回负数，不能用loss.item() < 1e-8判断
+        # 只检查nan和inf
+        if torch.isnan(loss) or torch.isinf(loss):
             continue
         
         loss.backward()
@@ -513,6 +517,7 @@ def train_one_epoch(model, loader, criteria, optimizer, device, clip_norm=1.0):
         optimizer.step()
         
         total_loss += loss.item()
+        valid_batches += 1
         for i in range(5):
             _, preds = outputs[i].max(1)
             correct[i] += preds.eq(targets[:, i]).sum().item()
@@ -520,7 +525,7 @@ def train_one_epoch(model, loader, criteria, optimizer, device, clip_norm=1.0):
         
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
     
-    return total_loss / max(len(loader), 1), [c / max(total, 1) for c in correct]
+    return total_loss / max(valid_batches, 1), [c / max(total, 1) for c in correct]
 
 
 @torch.no_grad()
@@ -589,7 +594,69 @@ def optimize_threshold(probs, targets):
                 best_thresh = t
                 best_metrics = m
     
-    return best_thresh, best_metrics or {'trade_count': 0, 'avg_profit': 0, 'win_rate': 0}
+    return best_thresh, best_metrics or {'trade_count': 0, 'avg_profit': 0, 'win_rate': 0, 'accuracy': 0, 'hold_rate': 1.0}
+
+
+def save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, best_profit, 
+                    best_state, best_thresholds, best_epoch, patience_counter, args, feature_cols):
+    """
+    保存训练检查点
+    
+    包含：
+    - 模型状态
+    - 优化器状态
+    - 学习率调度器状态
+    - 当前epoch
+    - 最佳指标
+    - 训练参数
+    """
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_profit': best_profit,
+        'best_state': best_state,
+        'best_thresholds': best_thresholds,
+        'best_epoch': best_epoch,
+        'patience_counter': patience_counter,
+        'args': vars(args),
+        'num_features': len(feature_cols),
+        'feature_cols': feature_cols,
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"  💾 Checkpoint saved: {checkpoint_path}")
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
+    """
+    加载训练检查点
+    
+    返回：
+    - start_epoch: 从哪个epoch继续训练
+    - best_profit: 最佳收益
+    - best_state: 最佳模型状态
+    - best_thresholds: 最佳阈值
+    - best_epoch: 最佳epoch
+    - patience_counter: 早停计数器
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    start_epoch = checkpoint['epoch'] + 1
+    best_profit = checkpoint['best_profit']
+    best_state = checkpoint['best_state']
+    best_thresholds = checkpoint['best_thresholds']
+    best_epoch = checkpoint['best_epoch']
+    patience_counter = checkpoint['patience_counter']
+    
+    print(f"✅ Checkpoint loaded from epoch {checkpoint['epoch']}")
+    print(f"   Best profit: {best_profit:.6f} (Epoch {best_epoch})")
+    
+    return start_epoch, best_profit, best_state, best_thresholds, best_epoch, patience_counter
 
 
 def main():
@@ -606,6 +673,10 @@ def main():
     parser.add_argument('--stride', type=int, default=5)
     parser.add_argument('--use_amp', action='store_true', default=True)
     parser.add_argument('--augment', action='store_true', default=True)
+    parser.add_argument('--resume', action='store_true', default=False, 
+                        help='从checkpoint继续训练')
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                        help='指定checkpoint路径（默认使用output_dir/latest_checkpoint.pt）')
     args = parser.parse_args()
     
     torch.manual_seed(42)
@@ -656,13 +727,26 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
+    # 初始化训练状态
     best_profit, best_state, best_thresholds, best_epoch = -float('inf'), None, {}, 0
     patience_counter, patience = 0, 15
+    start_epoch = 0
+    
+    # 检查是否需要从checkpoint恢复
+    if args.resume:
+        checkpoint_path = args.checkpoint_path or os.path.join(args.output_dir, 'latest_checkpoint.pt')
+        if os.path.exists(checkpoint_path):
+            start_epoch, best_profit, best_state, best_thresholds, best_epoch, patience_counter = \
+                load_checkpoint(checkpoint_path, model, optimizer, scheduler, device)
+            print(f"   Resuming from epoch {start_epoch}")
+        else:
+            print(f"⚠️  Checkpoint not found: {checkpoint_path}")
+            print("   Starting from scratch...")
     
     print("\n开始训练...")
     print("=" * 70)
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\n{'='*60}\nEpoch {epoch+1}/{args.epochs} | LR: {optimizer.param_groups[0]['lr']:.2e}\n{'='*60}")
         
         crit = [profit_criteria]*5 if epoch >= 30 else criteria
@@ -698,9 +782,22 @@ def main():
             print(f"  ⚠ No improvement ({patience_counter}/{patience})")
             if patience_counter >= patience:
                 print(f"\nEarly stopped at epoch {epoch+1}")
+                # 保存最终checkpoint
+                save_checkpoint(
+                    os.path.join(args.output_dir, 'latest_checkpoint.pt'),
+                    model, optimizer, scheduler, epoch, best_profit, 
+                    best_state, best_thresholds, best_epoch, patience_counter, args, feature_cols
+                )
                 break
         
         scheduler.step()
+        
+        # 每轮保存checkpoint（用于断点续训）
+        save_checkpoint(
+            os.path.join(args.output_dir, 'latest_checkpoint.pt'),
+            model, optimizer, scheduler, epoch, best_profit, 
+            best_state, best_thresholds, best_epoch, patience_counter, args, feature_cols
+        )
     
     if best_state:
         torch.save({
