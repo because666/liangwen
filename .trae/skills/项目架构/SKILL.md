@@ -1,218 +1,269 @@
----
-name: "项目架构"
-description: "良文杯高频量化预测项目架构说明。包含技术栈、模块设计、数据字段、训练策略和提交规范。在开发新功能或修改代码前应先了解此架构。"
----
+<br />
 
-# 良文杯 - T-KAN+OFI 高频方向预测项目架构
+***
 
-## 一、项目概述
+## 最终方案：T-KAN Pro 架构
 
-### 竞赛目标
-预测股票未来中间价的移动方向（下跌/不变/上涨），共5个预测窗口（5/10/20/40/60 tick）。
+### 设计理念
 
-### 评价标准
-- **累计收益率**（已扣除双边手续费0.02%）
-- 单次收益率 = 累计收益率 / (预测上涨总数 + 预测下跌总数)
+| 目标       | 策略                     |
+| :------- | :--------------------- |
+| **扩大参数** | 深度 T-KAN + 宽隐藏层 + 残差连接 |
+| **收益导向** | 收益加权 CE + 轻量级收益预测头     |
+| **训练稳定** | 数值稳定的 B-spline + 梯度裁剪  |
 
-### 核心创新
-1. **T-KAN编码器**：用可学习B样条替代线性权重，学习非线性时序特征
-2. **OFI特征**：订单流不平衡指标，捕捉买卖压力方向
-3. **收益感知损失**：直接优化交易收益，而非分类准确率
-4. **出手门机制**：让模型自己学会"何时值得交易"
+***
 
-## 二、技术栈
+### 架构设计
 
-| 层级 | 技术选型 | 说明 |
-|------|----------|------|
-| 开发语言 | Python 3.10 | 平台指定 |
-| 深度学习框架 | PyTorch 2.0+ | 兼容A6000/A10 GPU |
-| 数据处理 | Pandas, NumPy | 数据加载与OFI特征计算 |
-| 时序编码器 | TKAN / RKAN | B样条时序特征提取 |
-| 损失函数 | Huber + Profit-Aware Loss | 直接优化交易收益 |
+```
+输入: (batch, 100, 54)  # 100 tick, 54 features
+         ↓
+┌────────────────────────────────────────────┐
+│  特征嵌入层                   │
+│  Linear(54, 256) + LayerNorm + GELU        │  参数: 54×256 = 13,824
+│  Dropout(0.1)                              │
+└────────────────────────────────────────────┘
+         ↓
+┌────────────────────────────────────────────┐
+│  T-KAN 深度块 × 4 (核心)                    │
+│                                            │
+│  每个块:                                    │
+│  ├─ TKANLayer(256, 256)  # B-spline 非线性 │  参数: ~256×256×(8+3) ≈ 720K/块
+│  ├─ LayerNorm + GELU                       │
+│  ├─ Dropout(0.15)                          │
+│  └─ 残差连接                               │
+│                                            │
+│  总参数: ~290 万                            │
+└────────────────────────────────────────────┘
+         ↓
+┌────────────────────────────────────────────┐
+│  时序聚合层                 │
+│                                            │
+│  方案: 轻量级注意力 + Mean Pool             │
+│  MultiheadAttention(256, 8)                │  参数: 256×256×4 ≈ 260K
+│  LayerNorm + 残差                          │
+│  Mean(dim=1) → (batch, 256)                │
+└────────────────────────────────────────────┘
+         ↓
+┌────────────────────────────────────────────┐
+│  收益导向预测头 (关键创新)                   │
+│                                            │
+│  共享层:                                    │
+│  Linear(256, 128) + LayerNorm + GELU       │  参数: 256×128 = 32K
+│                                            │
+│  双分支:                                    │
+│  ├─ 分类分支: 5 × Linear(128, 3)           │  参数: 128×3×5 = 1.9K
+│  │   → 预测方向 (0/1/2)                    │
+│  │                                         │
+│  └─ 收益分支: 5 × Linear(128, 1)           │  参数: 128×1×5 = 0.6K
+│      → 预测期望收益 (用于损失计算)          │
+└────────────────────────────────────────────┘
+         ↓
+输出: 
+  - 分类 logits: (batch, 5, 3)
+  - 收益预测: (batch, 5)
+```
 
-## 三、数据字段说明
+**总参数量: 约 320 万**（比 V3 的 50 万大 6 倍，但结构更简单）
 
-### 原始数据字段（163列）
+***
 
-#### 基础行情（8列）
-- `date`, `sym`, `time` - 日期、标的、时间戳
-- `open`, `high`, `low`, `close` - OHLC价格（无量纲，相对昨收涨跌幅）
-- `volume_delta`, `amount_delta` - 成交量/金额变化
-
-#### 十档订单簿（40列）
-- `bid1` ~ `bid10` - 买一价~买十价（无量纲）
-- `ask1` ~ `ask10` - 卖一价~卖十价
-- `bsize1` ~ `bsize10` - 买一量~买十量（无量纲，换手率%）
-- `asize1` ~ `asize10` - 卖一量~卖十量
-
-#### 订单流统计（18列）
-- `lb_intst`, `la_intst` - 限价买单/卖单到达强度
-- `mb_intst`, `ma_intst` - **市价买单/卖单到达强度**（OFI核心字段）
-- `cb_intst`, `ca_intst` - 买单/卖单撤销强度
-- `lb_ind`, `la_ind`, `mb_ind`, `ma_ind`, `cb_ind`, `ca_ind` - 强度指标标志
-- `lb_acc`, `la_acc`, `mb_acc`, `ma_acc`, `cb_acc`, `ca_acc` - 强度平均变化率
-
-#### 衍生特征（92列）
-- `midprice`, `midprice1` ~ `midprice10` - 中间价
-- `spread1` ~ `spread10` - 买卖价差
-- `bid_diff1` ~ `bid_diff10`, `ask_diff1` ~ `ask_diff10` - 档位价差
-- `bid_mean`, `ask_mean`, `bsize_mean`, `asize_mean` - 均价/均量
-- `cumspread`, `imbalance` - 累计价差、不平衡
-- `avgbid`, `avgask`, `totalbsize`, `totalasize` - 委买/委卖均价和总量
-- `bid_rate1` ~ `bid_rate10`, `ask_rate1` ~ `ask_rate10` - 价格变化率
-- `bsize_rate1` ~ `bsize_rate10`, `asize_rate1` ~ `asize_rate10` - 量变化率
-
-#### 标签（5列）
-- `label_5`, `label_10`, `label_20`, `label_40`, `label_60` - 5个窗口的方向标签（0=下跌, 1=不变, 2=上涨）
-
-### OFI 特征计算（新增5列）
+### 收益导向损失函数（核心创新）
 
 ```python
-# 1. 原始OFI（基于市价单强度）
-ofi_raw = mb_intst - ma_intst
-
-# 2. 指数加权移动OFI（捕捉衰减效应）
-ofi_ewm = 0.9 * ofi_prev + 0.1 * ofi_raw
-
-# 3. 多档OFI（Multi-Level OFI）
-ofi_multilevel = sum([0.5, 0.3, 0.1, 0.05, 0.05][k] * (mb_intst - ma_intst) for k in range(5))
-
-# 4. OFI变化率（加速度）
-ofi_velocity = ofi_raw - ofi_raw.shift(1)
-
-# 5. OFI波动率（不确定性）
-ofi_volatility = ofi_raw.rolling(window=10).std()
-```
-
-## 四、模型架构
-
-```
-输入: (batch, 100, F)  # 100 ticks × F特征
-    │
-    ▼
-┌─────────────────────────────────────┐
-│  T-KAN/RKAN 编码器 (2-3层)          │
-│  - B样条网格数: 8                    │
-│  - B样条阶数: 3                      │
-│  - 隐藏维度: 256 → 128               │
-└─────────────────────────────────────┘
-    │
-    ▼
-特征向量 h: (batch, 128)
-    │
-    ├─────────────────┬─────────────────┐
-    │                 │                 │
-    ▼                 ▼                 ▼
-┌─────────┐     ┌─────────┐     ┌─────────────┐
-│ 回归头×5│     │ 出手门  │     │             │
-│ 预测ΔP  │     │ sigmoid │     │             │
-│ Huber   │     │ BCE     │     │             │
-└────┬────┘     └────┬────┘     └─────────────┘
-     │               │
-     └───────┬───────┘
-             │
-             ▼
-┌─────────────────────────────────────┐
-│  收益感知聚合层                      │
-│  if p_action > τ:                    │
-│    pred = 2 if ΔP > 0 else 0        │
-│  else:                               │
-│    pred = 1 (不变)                   │
-└─────────────────────────────────────┘
-    │
-    ▼
-输出: (batch, 5)  # 5个窗口的预测标签
-```
-
-## 五、损失函数
-
-### Stage 1: Huber Loss（预训练）
-```python
-loss = F.smooth_l1_loss(pred_delta, true_delta)
-```
-
-### Stage 2: Profit-Aware Loss（微调）
-```python
-def profit_aware_loss(pred_delta, true_delta, action_prob, threshold=0.5, gamma=0.03):
-    action = (action_prob > threshold).float()
-    trade_dir = torch.sign(pred_delta)  # +1买, -1卖, 0不变
+class ProfitGuidedLoss(nn.Module):
+    """
+    收益导向损失函数
     
-    # 实际收益 = 方向 × 真实变化 - 双边手续费0.02%
-    actual_return = trade_dir * true_delta - 0.0002
-    realized_return = action * actual_return
+    核心思想：
+    1. 分类损失：收益加权的交叉熵
+    2. 收益损失：预测收益与真实收益的 MSE
+    3. 交易惩罚：过度交易的惩罚项
     
-    # 损失 = 负收益 + 出手惩罚
-    loss = -realized_return.mean() + gamma * action.mean()
-    return loss
+    关键：避免 NaN，数值稳定
+    """
+    
+    def __init__(self, fee=0.0002, lambda_return=0.5, lambda_trade=0.1):
+        super().__init__()
+        self.fee = fee
+        self.lambda_return = lambda_return  # 收益损失权重
+        self.lambda_trade = lambda_trade    # 交易惩罚权重
+    
+    def forward(self, logits, return_pred, labels, true_returns):
+        """
+        Args:
+            logits: (batch, 5, 3) 分类预测
+            return_pred: (batch, 5) 收益预测
+            labels: (batch, 5) 真实标签
+            true_returns: (batch, 5) 真实收益
+        """
+        batch_size, num_windows = labels.shape
+        
+        # 1. 收益加权交叉熵
+        ce_loss = 0
+        for w in range(num_windows):
+            w_logits = logits[:, w, :]
+            w_labels = labels[:, w]
+            w_returns = true_returns[:, w].abs()
+            
+            # 收益越大，权重越高（但限制范围）
+            weights = torch.clamp(w_returns / self.fee, 0.5, 3.0)
+            
+            # 对"不变"类别给予基础权重
+            hold_mask = (w_labels == 1).float()
+            weights = weights * (1 - hold_mask) + 1.0 * hold_mask
+            
+            ce = F.cross_entropy(w_logits, w_labels, reduction='none')
+            ce_loss = ce_loss + (ce * weights).mean()
+        
+        ce_loss = ce_loss / num_windows
+        
+        # 2. 收益预测损失（关键：直接优化收益）
+        # 只对预测交易（非"不变"）的样本计算收益损失
+        preds = logits.argmax(dim=-1)  # (batch, 5)
+        trade_mask = (preds != 1).float()  # 交易掩码
+        
+        # 方向：上涨为 +1，下跌为 -1
+        direction = torch.where(preds == 2, 1.0, 
+                               torch.where(preds == 0, -1.0, 0.0))
+        
+        # 预期收益 = 方向 × 真实收益 - 手续费
+        expected_return = direction * true_returns - self.fee
+        
+        # 收益损失：预测收益与期望收益的差异
+        return_loss = F.mse_loss(
+            return_pred * trade_mask, 
+            expected_return * trade_mask, 
+            reduction='sum'
+        ) / (trade_mask.sum() + 1e-8)  # 防止除零
+        
+        # 3. 交易惩罚（鼓励观望）
+        trade_rate = trade_mask.mean()
+        trade_penalty = torch.relu(trade_rate - 0.5)  # 交易率超过 50% 才惩罚
+        
+        # 总损失
+        total_loss = ce_loss + self.lambda_return * return_loss + self.lambda_trade * trade_penalty
+        
+        return {
+            'loss': total_loss,
+            'ce_loss': ce_loss.item(),
+            'return_loss': return_loss.item(),
+            'trade_rate': trade_rate.item(),
+        }
 ```
 
-## 六、训练策略
+***
 
-### 阶段划分
-1. **Stage 1（50 epochs）**：预训练回归头+编码器，Huber Loss
-2. **Stage 2（20 epochs）**：联合微调回归头+出手门，Profit-Aware Loss
-3. **阈值调优**：验证集搜索最优阈值（0.3~0.7）
+### 数值稳定性保障
 
-### 超参数
-- 优化器：AdamW, lr=1e-3, weight_decay=1e-5
-- 学习率调度：CosineAnnealingLR
-- Batch Size：256~512
-- 早停：验证集收益连续5轮不提升
+#### 1. **B-spline 稳定化**
 
-## 七、目录结构
-
-```
-d:\量化\良文杯\
-├── 2026train_set/              # 训练数据
-├── 新版本_架构V2/              # 新架构开发目录
-│   ├── models/                 # 模型定义
-│   ├── training/               # 训练脚本
-│   ├── submission/             # 提交文件
-│   ├── utils/                  # 工具函数
-│   └── data_processing/        # 数据处理
-├── 旧版本_备份/                # 旧版本备份
-├── .trae/
-│   ├── rules/project_rules.md  # 项目规则
-│   └── skills/
-│       ├── 良文杯评测提交/      # 提交规范skill
-│       └── 项目架构/           # 本skill
-└── 全新架构.md                 # 架构设计文档
+```python
+class StableSplineLinear(nn.Module):
+    """数值稳定的 B-spline 线性层"""
+    
+    def __init__(self, in_features, out_features, grid_size=8, spline_order=3):
+        super().__init__()
+        # ... 初始化代码 ...
+        
+        # 关键：使用较小的初始化
+        nn.init.xavier_uniform_(self.base_weight, gain=0.5)
+        nn.init.normal_(self.spline_weight, std=0.01)  # 很小的初始化
+    
+    def b_splines(self, x):
+        # ... B-spline 计算 ...
+        
+        # 关键：对输入进行 clamp，防止极端值
+        x = torch.clamp(x, -2.0, 2.0)
+        
+        # ... 后续计算 ...
 ```
 
-## 八、提交规范
+#### 2. **梯度裁剪策略**
 
-### 必需文件
+```python
+# 更激进的梯度裁剪
+max_grad_norm = 0.3  # 比 0.5 更严格
+
+# 梯度检查
+for param in model.parameters():
+    if param.grad is not None:
+        if torch.isnan(param.grad).any():
+            param.grad = torch.zeros_like(param.grad)
 ```
-submission.zip
-├── Predictor.py        # 预测类（必须处理Polars DataFrame）
-├── model.py           # 模型定义
-├── best_model.pt      # 模型权重
-├── best_thresholds.json  # 阈值配置
-├── config.json        # 配置文件
-└── requirements.txt   # 依赖（必须包含pyarrow）
+
+#### 3. **学习率调度**
+
+```python
+# 更保守的学习率
+lr = 3e-5  # 比之前更小
+
+# Warm-up + Cosine
+warmup_epochs = 5
+scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
 ```
 
-### 关键注意事项
-1. **Polars DataFrame**：评测平台传入Polars格式，必须先转换为Pandas
-2. **特征计算**：OFI特征需要在推理时实时计算
-3. **绝对路径**：使用 `os.path.dirname(__file__)` 加载模型
-4. **torch.load**：添加 `weights_only=False` 参数
+***
 
-## 九、可行性分析
+### 训练策略
 
-### ✅ 已确认可行
-- [x] OFI相关字段存在（mb_intst, ma_intst等）
-- [x] 数据包含163列，特征丰富
-- [x] T-KAN有官方开源实现
-- [x] PyTorch 2.0+ 支持B样条操作
+| 阶段      | Epochs | 学习率         | 目标    |
+| :------ | :----- | :---------- | :---- |
+| Warm-up | 5      | 1e-5 → 3e-5 | 稳定初始化 |
+| 主训练     | 15     | 3e-5 → 1e-5 | 收敛    |
+| 微调      | 5      | 1e-6        | 精调    |
 
-### ⚠️ 需要注意
-- T-KAN实现需要从官方仓库提取
-- 收益感知损失需要梯度裁剪防止不稳定
-- 阈值搜索需使用独立验证集防止过拟合
+***
 
-### 预期效果
-- 模型参数量：~12M（可调至30M以内）
-- 训练时间：约2-3小时（A10 GPU）
-- 推理时间：<0.5秒/batch
-- 预期收益提升：30%~80%
+### 与 V3 的对比
+
+| 方面    | V3 架构                | T-KAN Pro      |
+| :---- | :------------------- | :------------- |
+| 参数量   | 50 万                 | 320 万          |
+| 专家数量  | 4 个                  | 无（单模型）         |
+| 损失函数  | CE + Sharpe + Sparse | 收益加权 CE + 收益预测 |
+| 训练稳定性 | 差（经常 NaN）            | 好（数值稳定）        |
+| 可解释性  | 差（多专家融合）             | 好（单一 T-KAN）    |
+| 预期效果  | 不稳定                  | 稳定且有提升         |
+
+***
+
+### 为什么这个方案更好？
+
+#### 1. **参数效率高**
+
+- T-KAN 的 B-spline 参数效率比 Transformer 高
+- 320 万参数主要集中在非线性建模上
+
+#### 2. **收益导向明确**
+
+- 直接预测收益，而不是间接通过分类
+- 收益损失直接优化目标
+
+#### 3. **训练稳定**
+
+- 单一模型，没有多专家冲突
+- 数值稳定的 B-spline 实现
+- 保守的学习率和梯度裁剪
+
+#### 4. **避免过拟合**
+
+- Dropout 0.15
+- Weight Decay 1e-4
+- Early Stopping
+
+***
+
+## 预期效果
+
+| 指标      | 预期范围     |
+| :------ | :------- |
+| 训练 Loss | 稳定下降，不震荡 |
+| 交易率     | 30-60%   |
+| 验证收益    | 正收益      |
+| NaN 出现  | 0 次      |
+
+***
+
+这个方案如何？如果认可，我可以开始实现代码。

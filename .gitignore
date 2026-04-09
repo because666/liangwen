@@ -3,13 +3,6 @@
 2026train_set.zip
 *.parquet
 
-# 大型压缩包（超过GitHub限制）
-历史记录/导出文件.zip
-历史记录/旧版本备份.zip
-历史记录/submission文件夹.zip
-历史记录/T-KAN_OFI_架构V2_20250408/submission.zip
-旧版本_备份/提交文件/*.zip
-
 # 模型权重文件
 *.pt
 *.pth
@@ -17,6 +10,9 @@
 *.h5
 *.pkl
 *.pickle
+
+# 压缩包文件（太大不上传）
+*.zip
 
 # Python缓存
 __pycache__/
