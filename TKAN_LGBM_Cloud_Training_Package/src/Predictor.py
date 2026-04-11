@@ -42,7 +42,6 @@ FEATURE_COLS = [
     'ask1', 'ask2', 'ask3', 'ask4', 'ask5', 'ask6', 'ask7', 'ask8', 'ask9', 'ask10',
     'bsize1', 'bsize2', 'bsize3', 'bsize4', 'bsize5', 'bsize6', 'bsize7', 'bsize8', 'bsize9', 'bsize10',
     'asize1', 'asize2', 'asize3', 'asize4', 'asize5', 'asize6', 'asize7', 'asize8', 'asize9', 'asize10',
-    'mb_intst', 'ma_intst', 'lb_intst', 'la_intst', 'cb_intst', 'ca_intst',
 ]
 
 WINDOW_SIZES = [5, 10, 20, 40, 60]
@@ -233,8 +232,6 @@ def clean_features(features: np.ndarray) -> np.ndarray:
             features[:, i] = np.clip(features[:, i], -0.3, 0.3)
         elif col.startswith('bsize') or col.startswith('asize'):
             features[:, i] = np.clip(features[:, i], 0, 100)
-        elif col.endswith('_intst'):
-            features[:, i] = np.clip(features[:, i], -10, 10)
     return features
 
 

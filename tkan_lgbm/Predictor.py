@@ -1,16 +1,21 @@
 """
-T-KAN + LightGBM 预测器
+T-KAN + LightGBM 二分类预测器（阈值拒绝版本）
 
 评测规范：
 1. 使用 os.path.dirname(__file__) 加载模型（绝对路径）
 2. 处理 Polars DataFrame（兼容 Pandas/Polars/PyArrow）
 3. 只使用 config.json 中列出的 40 维原始价量特征
-4. T-KAN 编码器提取 128 维特征 → LightGBM 预测 5 个窗口方向
+4. T-KAN 编码器提取 128 维特征 → LightGBM 二分类 → 阈值决策
 5. 返回 List[List[int]] 格式
 
 架构流程：
 输入 DataFrame(100, 40) → numpy 提取 → 归一化 → T-KAN 编码器(128维)
-→ LightGBM x 5 → List[int] (5个窗口方向)
+→ LightGBM 二分类 x 5 → p_up 概率 → 阈值判断 → List[int] (5个窗口方向)
+
+决策逻辑：
+- 若 p_up > τ: 预测上涨 (2)
+- 若 (1 - p_up) > τ: 预测下跌 (0)
+- 否则: 预测不变 (1) — 拒绝出手
 
 模型加载策略：
 优先从检查点内嵌的 lgbm_models 字典加载（避免路径编码问题），
@@ -42,7 +47,6 @@ FEATURE_COLS = [
     'ask1', 'ask2', 'ask3', 'ask4', 'ask5', 'ask6', 'ask7', 'ask8', 'ask9', 'ask10',
     'bsize1', 'bsize2', 'bsize3', 'bsize4', 'bsize5', 'bsize6', 'bsize7', 'bsize8', 'bsize9', 'bsize10',
     'asize1', 'asize2', 'asize3', 'asize4', 'asize5', 'asize6', 'asize7', 'asize8', 'asize9', 'asize10',
-    'mb_intst', 'ma_intst', 'lb_intst', 'la_intst', 'cb_intst', 'ca_intst',
 ]
 
 WINDOW_SIZES = [5, 10, 20, 40, 60]
@@ -152,7 +156,6 @@ def df_to_numpy(df) -> tuple:
     """将 DataFrame 转换为 numpy 数组
 
     兼容 Pandas/Polars/PyArrow 多种格式。
-    绝不往 DataFrame 写入新列。
 
     参数：
         df: 输入 DataFrame
@@ -233,15 +236,13 @@ def clean_features(features: np.ndarray) -> np.ndarray:
             features[:, i] = np.clip(features[:, i], -0.3, 0.3)
         elif col.startswith('bsize') or col.startswith('asize'):
             features[:, i] = np.clip(features[:, i], 0, 100)
-        elif col.endswith('_intst'):
-            features[:, i] = np.clip(features[:, i], -10, 10)
     return features
 
 
 def _load_lgbm_from_checkpoint(checkpoint: dict, current_dir: str) -> dict:
-    """加载 LightGBM 模型
+    """加载 LightGBM 二分类模型
 
-    优先从检查点内嵌的 lgbm_models 字典加载（避免路径编码问题），
+    优先从检查点内嵌的 lgbm_models 字典加载，
     回退到独立 .txt 文件加载。
 
     参数：
@@ -278,13 +279,38 @@ def _load_lgbm_from_checkpoint(checkpoint: dict, current_dir: str) -> dict:
     return lgbm_models
 
 
+def _load_thresholds(checkpoint: dict) -> dict:
+    """加载各窗口的最优出手阈值
+
+    参数：
+        checkpoint: PyTorch 检查点字典
+    返回：
+        {window_size: float} 阈值字典
+    """
+    thresholds = checkpoint.get('thresholds', None)
+    if thresholds is not None:
+        result = {}
+        for w in WINDOW_SIZES:
+            result[w] = thresholds.get(f'{w}', 0.6)
+            if isinstance(result[w], str):
+                result[w] = float(result[w])
+        return result
+
+    return {w: 0.6 for w in WINDOW_SIZES}
+
+
 class Predictor:
-    """T-KAN + LightGBM 预测器
+    """T-KAN + LightGBM 二分类预测器（阈值拒绝版本）
 
     评测平台调用规范：
     - 输入: List[pd.DataFrame]，长度为 batch
     - 每个DataFrame为100个tick的数据，列名为config.json中的feature
     - 输出: List[List[int]]，长度为 batch，每个内层List长度为5
+
+    决策逻辑：
+    - 若 p_up > τ: 预测上涨 (2)
+    - 若 (1 - p_up) > τ: 预测下跌 (0)
+    - 否则: 预测不变 (1) — 拒绝出手
     """
 
     def __init__(self):
@@ -299,6 +325,7 @@ class Predictor:
         self.config = checkpoint.get('config', {})
         self.mean = checkpoint.get('mean', None)
         self.std = checkpoint.get('std', None)
+        self.binary_mode = checkpoint.get('binary_mode', False)
 
         input_dim = self.config.get('input_dim', len(FEATURE_COLS))
         hidden_dim = self.config.get('hidden_dim', 128)
@@ -329,6 +356,9 @@ class Predictor:
 
         self.lgbm_models = _load_lgbm_from_checkpoint(checkpoint, current_dir)
         print(f"LightGBM 模型加载成功: {len(self.lgbm_models)} 个窗口")
+
+        self.thresholds = _load_thresholds(checkpoint)
+        print(f"出手阈值: {self.thresholds}")
 
         config_path = os.path.join(current_dir, 'config.json')
         if os.path.exists(config_path):
@@ -396,11 +426,18 @@ class Predictor:
 
             for w in WINDOW_SIZES:
                 if w in self.lgbm_models:
-                    pred_proba = self.lgbm_models[w].predict(sample_features)
-                    pred_label = int(pred_proba.argmax(axis=1)[0])
+                    p_up = self.lgbm_models[w].predict(sample_features)[0]
+                    tau = self.thresholds.get(w, 0.6)
+
+                    if p_up > tau:
+                        pred = 2
+                    elif (1 - p_up) > tau:
+                        pred = 0
+                    else:
+                        pred = 1
                 else:
-                    pred_label = 1
-                window_preds.append(pred_label)
+                    pred = 1
+                window_preds.append(pred)
 
             results.append(window_preds)
 
