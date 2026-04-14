@@ -1,20 +1,16 @@
 """
-T-KAN + LightGBM 预测器
+T-KAN + LightGBM 两阶段模型预测器
+
+两阶段模型设计：
+- 阶段1: 判断是否值得交易（波动是否够大）
+- 阶段2: 只对值得交易的样本预测方向
 
 评测规范：
 1. 使用 os.path.dirname(__file__) 加载模型（绝对路径）
 2. 处理 Polars DataFrame（兼容 Pandas/Polars/PyArrow）
 3. 只使用 config.json 中列出的 40 维原始价量特征
-4. T-KAN 编码器提取 128 维特征 → LightGBM 预测 5 个窗口方向
+4. T-KAN 编码器提取 128 维特征 → 两阶段 LightGBM 预测
 5. 返回 List[List[int]] 格式
-
-架构流程：
-输入 DataFrame(100, 40) → numpy 提取 → 归一化 → T-KAN 编码器(128维)
-→ LightGBM x 5 → List[int] (5个窗口方向)
-
-模型加载策略：
-优先从检查点内嵌的 lgbm_models 字典加载（避免路径编码问题），
-回退到独立 .txt 文件加载。
 """
 
 import os
@@ -45,6 +41,7 @@ FEATURE_COLS = [
 ]
 
 WINDOW_SIZES = [5, 10, 20, 40, 60]
+FEE = 0.0001
 
 
 class StableSplineLinear(nn.Module):
@@ -148,16 +145,7 @@ class TKANEncoder(nn.Module):
 
 
 def df_to_numpy(df) -> tuple:
-    """将 DataFrame 转换为 numpy 数组
-
-    兼容 Pandas/Polars/PyArrow 多种格式。
-    绝不往 DataFrame 写入新列。
-
-    参数：
-        df: 输入 DataFrame
-    返回：
-        (numpy_array, column_names)
-    """
+    """将 DataFrame 转换为 numpy 数组"""
     if isinstance(df, pd.DataFrame):
         cols = list(df.columns)
         arr = df.to_numpy(dtype=np.float32, copy=False)
@@ -204,15 +192,7 @@ def df_to_numpy(df) -> tuple:
 
 def extract_features_from_df(arr: np.ndarray, cols: list,
                              feature_cols: list) -> np.ndarray:
-    """从 numpy 数组提取指定特征列
-
-    参数：
-        arr: (n_ticks, n_cols) numpy 数组
-        cols: 列名列表
-        feature_cols: 需要提取的特征列名
-    返回：
-        (n_ticks, len(feature_cols)) numpy 数组
-    """
+    """从 numpy 数组提取指定特征列"""
     col_idx = {c: i for i, c in enumerate(cols)}
     n = arr.shape[0]
     result = np.zeros((n, len(feature_cols)), dtype=np.float32)
@@ -232,58 +212,67 @@ def clean_features(features: np.ndarray) -> np.ndarray:
             features[:, i] = np.clip(features[:, i], -0.3, 0.3)
         elif col.startswith('bsize') or col.startswith('asize'):
             features[:, i] = np.clip(features[:, i], 0, 100)
-        elif col.endswith('_intst'):
-            features[:, i] = np.clip(features[:, i], -10, 10)
     return features
 
 
-def _load_lgbm_from_checkpoint(checkpoint: dict, current_dir: str) -> dict:
-    """加载 LightGBM 模型
+def _extract_encoder_state(state_dict):
+    """从完整模型的 state_dict 中提取编码器部分"""
+    encoder_state = {}
+    for k, v in state_dict.items():
+        if k.startswith('encoder.'):
+            new_key = k[8:]
+            encoder_state[new_key] = v
+    return encoder_state
 
-    优先从检查点内嵌的 lgbm_models 字典加载（避免路径编码问题），
-    回退到独立 .txt 文件加载。
 
-    参数：
-        checkpoint: PyTorch 检查点字典
-        current_dir: 当前文件目录
-    返回：
-        {window_size: lgb.Booster} 字典
-    """
+def _load_two_stage_models_from_checkpoint(checkpoint: dict, current_dir: str):
+    """加载两阶段 LightGBM 模型"""
     if lgb is None:
         raise ImportError("lightgbm 未安装，请检查 requirements.txt")
 
-    lgbm_models = {}
+    stage1_models = {}
+    stage2_models = {}
 
-    lgbm_model_strs = checkpoint.get('lgbm_models', None)
-    if lgbm_model_strs is not None:
+    stage1_model_strs = checkpoint.get('stage1_models', None)
+    stage2_model_strs = checkpoint.get('stage2_models', None)
+
+    if stage1_model_strs is not None and stage2_model_strs is not None:
         for w in WINDOW_SIZES:
             key = f'w{w}'
-            if key in lgbm_model_strs:
-                lgbm_models[w] = lgb.Booster(model_str=lgbm_model_strs[key])
-        if len(lgbm_models) == len(WINDOW_SIZES):
-            return lgbm_models
+            if key in stage1_model_strs:
+                stage1_models[w] = lgb.Booster(model_str=stage1_model_strs[key])
+            if key in stage2_model_strs:
+                stage2_models[w] = lgb.Booster(model_str=stage2_model_strs[key])
+        
+        if len(stage1_models) == len(WINDOW_SIZES) and len(stage2_models) == len(WINDOW_SIZES):
+            return stage1_models, stage2_models
 
     for w in WINDOW_SIZES:
-        model_path = os.path.join(current_dir, f'lgbm_w{w}.txt')
-        if os.path.exists(model_path):
-            with open(model_path, 'r', encoding='utf-8') as f:
-                model_str = f.read()
-            lgbm_models[w] = lgb.Booster(model_str=model_str)
+        stage1_path = os.path.join(current_dir, f'stage1_w{w}.txt')
+        stage2_path = os.path.join(current_dir, f'stage2_w{w}.txt')
+        
+        if os.path.exists(stage1_path):
+            with open(stage1_path, 'r', encoding='utf-8') as f:
+                stage1_models[w] = lgb.Booster(model_str=f.read())
+        
+        if os.path.exists(stage2_path):
+            with open(stage2_path, 'r', encoding='utf-8') as f:
+                stage2_models[w] = lgb.Booster(model_str=f.read())
 
-    if len(lgbm_models) < len(WINDOW_SIZES):
-        missing = [w for w in WINDOW_SIZES if w not in lgbm_models]
-        raise FileNotFoundError(f"LightGBM 模型文件缺失: 窗口 {missing}")
+    if len(stage1_models) < len(WINDOW_SIZES) or len(stage2_models) < len(WINDOW_SIZES):
+        missing1 = [w for w in WINDOW_SIZES if w not in stage1_models]
+        missing2 = [w for w in WINDOW_SIZES if w not in stage2_models]
+        raise FileNotFoundError(f"两阶段模型文件缺失: 阶段1 {missing1}, 阶段2 {missing2}")
 
-    return lgbm_models
+    return stage1_models, stage2_models
 
 
 class Predictor:
-    """T-KAN + LightGBM 预测器
-
-    评测平台调用规范：
-    - 输入: List[pd.DataFrame]，长度为 batch
-    - 每个DataFrame为100个tick的数据，列名为config.json中的feature
-    - 输出: List[List[int]]，长度为 batch，每个内层List长度为5
+    """T-KAN + LightGBM 两阶段模型预测器
+    
+    两阶段模型设计：
+    - 阶段1: 判断是否值得交易（波动是否够大）
+    - 阶段2: 只对值得交易的样本预测方向
     """
 
     def __init__(self):
@@ -314,16 +303,6 @@ class Predictor:
             dropout=0.0,
         ).to(self.device)
 
-        # 处理 state_dict：只保留编码器部分，移除 'encoder.' 前缀
-        def _extract_encoder_state(state_dict):
-            encoder_state = {}
-            for k, v in state_dict.items():
-                if k.startswith('encoder.'):
-                    new_key = k[8:]
-                    encoder_state[new_key] = v
-            return encoder_state
-
-        # 加载编码器权重（strict=False 忽略缺失的 buffer，如 grid）
         if 'ema_encoder_state' in checkpoint:
             ema_state = checkpoint['ema_encoder_state']
             if len(ema_state) > 0:
@@ -336,15 +315,11 @@ class Predictor:
         self.encoder.eval()
         print(f"T-KAN 编码器加载成功: hidden_dim={hidden_dim}, num_layers={num_layers}")
 
-        self.lgbm_models = _load_lgbm_from_checkpoint(checkpoint, current_dir)
-        print(f"LightGBM 模型加载成功: {len(self.lgbm_models)} 个窗口")
+        self.stage1_models, self.stage2_models = _load_two_stage_models_from_checkpoint(checkpoint, current_dir)
+        print(f"两阶段 LightGBM 模型加载成功: {len(self.stage1_models)} 个窗口")
 
-        # 加载阈值
-        self.thresholds = checkpoint.get('thresholds', {})
-        if not self.thresholds:
-            # 默认阈值
-            self.thresholds = {w: 0.6 for w in WINDOW_SIZES}
-        print(f"出手阈值: {self.thresholds}")
+        self.thresholds = checkpoint.get('thresholds', {w: 0.6 for w in WINDOW_SIZES})
+        print(f"方向预测阈值: {self.thresholds}")
 
         config_path = os.path.join(current_dir, 'config.json')
         if os.path.exists(config_path):
@@ -356,11 +331,11 @@ class Predictor:
 
     def preprocess(self, x: List) -> torch.Tensor:
         """预处理输入数据
-
+        
         参数：
             x: List[DataFrame]，长度为 batch，每个 DataFrame 为 100 tick 数据
         返回：
-            torch.Tensor: (batch, 100, feature_dim)
+            features_tensor: (batch, 100, feature_dim)
         """
         batch_size = len(x)
         seq_len = 100
@@ -385,8 +360,8 @@ class Predictor:
         return torch.from_numpy(features).to(self.device, dtype=torch.float32)
 
     def predict(self, x: List) -> List[List[int]]:
-        """预测接口
-
+        """预测接口（两阶段模型）
+        
         参数：
             x: List[DataFrame]，长度为 batch
         返回：
@@ -408,23 +383,28 @@ class Predictor:
 
         for i in range(batch_size):
             sample_features = encoded_np[i:i + 1]
+            
             window_preds = []
 
             for w in WINDOW_SIZES:
-                if w in self.lgbm_models:
-                    # 二分类模型：predict 返回上涨概率
-                    p_up = self.lgbm_models[w].predict(sample_features)[0]
+                if w not in self.stage1_models or w not in self.stage2_models:
+                    pred_label = 1
+                else:
+                    stage1_proba = self.stage1_models[w].predict(sample_features)[0]
+                    stage2_proba = self.stage2_models[w].predict(sample_features)[0]
+                    
                     tau = self.thresholds.get(w, 0.6)
                     
-                    # 阈值决策
-                    if p_up > tau:
-                        pred_label = 2  # 上涨
-                    elif (1 - p_up) > tau:
-                        pred_label = 0  # 下跌
+                    if stage1_proba > 0.5:
+                        if stage2_proba > tau:
+                            pred_label = 2
+                        elif (1 - stage2_proba) > tau:
+                            pred_label = 0
+                        else:
+                            pred_label = 1
                     else:
-                        pred_label = 1  # 不变（拒绝出手）
-                else:
-                    pred_label = 1
+                        pred_label = 1
+                
                 window_preds.append(pred_label)
 
             results.append(window_preds)
