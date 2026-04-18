@@ -458,7 +458,21 @@ class Predictor:
         self.thresholds = checkpoint.get('thresholds', {})
         if not self.thresholds:
             self.thresholds = {w: 0.6 for w in WINDOW_SIZES}
-        print(f"基础阈值: {self.thresholds}")
+        
+        # 调整阈值：短窗口提高（更严格），长窗口降低（更宽松）
+        threshold_adjust = {
+            5: 0.07,    # 0.6 + 0.07 = 0.67 (更严格)
+            10: 0.05,   # 0.6 + 0.05 = 0.65
+            20: 0.03,   # 0.6 + 0.03 = 0.63
+            40: -0.05,  # 0.6 - 0.05 = 0.55 (更宽松)
+            60: -0.08,  # 0.6 - 0.08 = 0.52
+        }
+        for w in WINDOW_SIZES:
+            if w in threshold_adjust:
+                base = self.thresholds.get(w, 0.6)
+                self.thresholds[w] = np.clip(base + threshold_adjust[w], 0.51, 0.95)
+        
+        print(f"调整后阈值: {self.thresholds}")
 
         # 初始化动态阈值调整器
         self.use_dynamic_threshold = use_dynamic_threshold
@@ -622,8 +636,8 @@ class Predictor:
 
 if __name__ == '__main__':
     predictor = Predictor(
-        use_dynamic_threshold=True,
-        use_post_filter=True,
+        use_dynamic_threshold=False,
+        use_post_filter=False,
         use_regression=False,
         use_two_stage=False
     )
