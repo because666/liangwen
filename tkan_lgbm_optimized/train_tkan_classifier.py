@@ -164,41 +164,24 @@ class TKANClassifier(nn.Module):
 
 
 class StockDataset(Dataset):
-    """股票数据集（支持数据增强）"""
+    """股票数据集"""
 
-    def __init__(self, sequences, labels, returns=None, weights=None, 
-                 augment=False, noise_scale=0.01, drop_prob=0.1):
+    def __init__(self, sequences, labels, returns=None, weights=None):
         self.sequences = torch.from_numpy(sequences).float()
         self.labels = torch.from_numpy(labels).long()
         self.returns = torch.from_numpy(returns).float() if returns is not None else None
         self.weights = torch.from_numpy(weights).float() if weights is not None else None
-        self.augment = augment
-        self.noise_scale = noise_scale
-        self.drop_prob = drop_prob
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        
-        # 数据增强（只在训练时使用）
-        if self.augment:
-            # 添加高斯噪声
-            noise = torch.randn_like(seq) * self.noise_scale
-            seq = seq + noise
-            
-            # 随机时间步丢弃（Temporal Dropout）
-            if torch.rand(1) < 0.5:
-                mask = torch.rand(seq.shape[0]) > self.drop_prob
-                seq = seq * mask.unsqueeze(-1).float()
-        
         if self.returns is not None and self.weights is not None:
-            return seq, self.labels[idx], self.returns[idx], self.weights[idx]
+            return self.sequences[idx], self.labels[idx], self.returns[idx], self.weights[idx]
         elif self.returns is not None:
-            return seq, self.labels[idx], self.returns[idx]
+            return self.sequences[idx], self.labels[idx], self.returns[idx]
         else:
-            return seq, self.labels[idx]
+            return self.sequences[idx], self.labels[idx]
 
 
 def clean_features(features: np.ndarray) -> np.ndarray:
@@ -279,44 +262,176 @@ def compute_sample_weights(returns: np.ndarray, scale: float = 100.0) -> np.ndar
     return weights.astype(np.float32)
 
 
-class LabelSmoothingCrossEntropy(nn.Module):
-    """标签平滑交叉熵损失"""
+class FocalLoss(nn.Module):
+    """Focal Loss - 关注难分类样本
     
-    def __init__(self, smoothing=0.1):
+    公式：FL = -α(1-p)^γ * log(p)
+    
+    参数：
+        alpha: 类别权重，处理类别不平衡
+        gamma: 聚焦参数，降低易分类样本权重
+        reduction: 'mean' 或 'none'
+    """
+    
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super().__init__()
-        self.smoothing = smoothing
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
         
     def forward(self, logits, targets, weights=None):
         """
         参数：
             logits: (batch, num_classes)
-            targets: (batch,)
+            targets: (batch,) 或 (batch, num_classes) 软标签
             weights: (batch,) 可选的样本权重
         """
-        batch_size, num_classes = logits.shape
+        num_classes = logits.shape[-1]
         
-        # 创建平滑后的标签
-        smoothed_targets = torch.zeros_like(logits)
-        smoothed_targets.fill_(self.smoothing / (num_classes - 1))
-        smoothed_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
+        # 计算概率
+        probs = F.softmax(logits, dim=-1)
+        
+        # 处理硬标签和软标签
+        if targets.dim() == 1:
+            # 硬标签：转换为 one-hot
+            targets_onehot = F.one_hot(targets, num_classes).float()
+        else:
+            # 软标签（Mixup 产生）
+            targets_onehot = targets
         
         # 计算交叉熵
         log_probs = F.log_softmax(logits, dim=-1)
-        loss = -(smoothed_targets * log_probs).sum(dim=-1)
+        ce_loss = -(targets_onehot * log_probs).sum(dim=-1)
         
+        # 计算调制因子 (1 - p)^γ
+        # p 是真实类别的预测概率
+        pt = (targets_onehot * probs).sum(dim=-1)
+        focal_weight = (1 - pt) ** self.gamma
+        
+        # 应用类别权重
+        if self.alpha is not None:
+            if isinstance(self.alpha, (list, tuple)):
+                alpha_tensor = torch.tensor(self.alpha, device=logits.device)
+            else:
+                alpha_tensor = self.alpha
+            # 计算每个样本的 alpha 权重
+            alpha_weight = (targets_onehot * alpha_tensor.unsqueeze(0)).sum(dim=-1)
+            focal_weight = focal_weight * alpha_weight
+        
+        # 计算最终损失
+        loss = focal_weight * ce_loss
+        
+        # 应用样本权重
         if weights is not None:
-            loss = (loss * weights).mean()
+            loss = loss * weights
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
         else:
-            loss = loss.mean()
-            
-        return loss
+            return loss
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, use_weights=False):
-    """训练一个 epoch"""
+def mixup_data(x, y, alpha=0.2, device='cuda'):
+    """Mixup 数据增强
+    
+    参数：
+        x: (batch, seq_len, feature_dim) 输入序列
+        y: (batch, num_windows) 标签
+        alpha: Beta 分布参数
+        device: 设备
+    
+    返回：
+        x_mixed: 混合后的输入
+        y_mixed: 混合后的软标签
+        lam: 混合系数
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+    
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(device)
+    
+    # 混合输入
+    x_mixed = lam * x + (1 - lam) * x[index]
+    
+    # 混合标签（转换为软标签）
+    num_windows = y.size(1)
+    num_classes = 3
+    y_onehot = F.one_hot(y, num_classes).float()  # (batch, num_windows, 3)
+    y_onehot_shuffled = y_onehot[index]
+    y_mixed = lam * y_onehot + (1 - lam) * y_onehot_shuffled
+    
+    return x_mixed, y_mixed, lam
+
+
+def adversarial_attack_fgsm(model, x, y, criterion, epsilon=0.01, device='cuda'):
+    """FGSM 对抗攻击
+    
+    参数：
+        model: 模型
+        x: (batch, seq_len, feature_dim) 输入
+        y: (batch, num_windows, 3) 软标签
+        criterion: 损失函数
+        epsilon: 扰动强度
+        device: 设备
+    
+    返回：
+        x_adv: 对抗样本
+    """
+    x_adv = x.clone().detach().requires_grad_(True)
+    
+    # 前向传播
+    logits = model(x_adv)
+    
+    # 计算损失（对每个窗口求和）
+    loss = 0.0
+    for w_idx in range(logits.size(1)):
+        # 软标签损失
+        log_probs = F.log_softmax(logits[:, w_idx, :], dim=-1)
+        ce_loss = -(y[:, w_idx, :] * log_probs).sum(dim=-1).mean()
+        loss += ce_loss
+    
+    # 反向传播
+    loss.backward()
+    
+    # 生成对抗扰动
+    grad = x_adv.grad.data
+    x_adv = x_adv + epsilon * grad.sign()
+    
+    # 投影到原始样本附近
+    x_adv = torch.clamp(x_adv, x - epsilon, x + epsilon)
+    x_adv = x_adv.detach()
+    
+    return x_adv
+
+
+def train_epoch(model, dataloader, optimizer, criterion, device, 
+                use_mixup=False, mixup_alpha=0.2,
+                use_adv=False, adv_epsilon=0.01,
+                use_weights=False):
+    """训练一个 epoch（支持 Mixup + 对抗训练 + Focal Loss）
+    
+    参数：
+        model: 模型
+        dataloader: 数据加载器
+        optimizer: 优化器
+        criterion: 损失函数（Focal Loss）
+        device: 设备
+        use_mixup: 是否使用 Mixup
+        mixup_alpha: Mixup 的 alpha 参数
+        use_adv: 是否使用对抗训练
+        adv_epsilon: 对抗扰动强度
+        use_weights: 是否使用样本权重
+    """
     model.train()
     total_loss = 0.0
     total_samples = 0
+    total_loss_nat = 0.0
+    total_loss_adv = 0.0
 
     pbar = tqdm(dataloader, desc="训练", leave=False)
     for batch in pbar:
@@ -329,28 +444,74 @@ def train_epoch(model, dataloader, optimizer, criterion, device, use_weights=Fal
 
         sequences = sequences.to(device)
         labels = labels.to(device)
+        
+        batch_size = sequences.size(0)
 
+        # Step 1: Mixup 数据增强
+        if use_mixup:
+            sequences_mixed, labels_soft, lam = mixup_data(
+                sequences, labels, alpha=mixup_alpha, device=device
+            )
+        else:
+            sequences_mixed = sequences
+            # 转换为软标签（one-hot）
+            labels_soft = F.one_hot(labels, 3).float()
+            lam = 1.0
+
+        # Step 2: 计算自然样本损失
         optimizer.zero_grad()
-        logits = model(sequences)  # (batch, num_windows, 3)
-
-        loss = 0.0
+        logits_nat = model(sequences_mixed)
+        
+        loss_nat = 0.0
         for w_idx in range(len(WINDOW_SIZES)):
-            if use_weights and weights is not None:
-                loss += criterion(logits[:, w_idx, :], labels[:, w_idx], weights)
-            else:
-                loss += criterion(logits[:, w_idx, :], labels[:, w_idx])
+            loss_nat += criterion(logits_nat[:, w_idx, :], labels_soft[:, w_idx, :], weights)
+        loss_nat = loss_nat / len(WINDOW_SIZES)
 
-        loss = loss / len(WINDOW_SIZES)
+        # Step 3: 对抗训练
+        if use_adv:
+            # 生成对抗样本
+            sequences_adv = adversarial_attack_fgsm(
+                model, sequences_mixed, labels_soft, criterion, 
+                epsilon=adv_epsilon, device=device
+            )
+            
+            # 计算对抗样本损失
+            logits_adv = model(sequences_adv)
+            loss_adv = 0.0
+            for w_idx in range(len(WINDOW_SIZES)):
+                loss_adv += criterion(logits_adv[:, w_idx, :], labels_soft[:, w_idx, :], weights)
+            loss_adv = loss_adv / len(WINDOW_SIZES)
+            
+            # 总损失 = 自然损失 + 对抗损失
+            loss = (loss_nat + loss_adv) / 2
+        else:
+            loss = loss_nat
+            loss_adv = torch.tensor(0.0)
+
+        # 反向传播
         loss.backward()
-
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_loss += loss.item() * sequences.size(0)
-        total_samples += sequences.size(0)
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        total_loss += loss.item() * batch_size
+        total_loss_nat += loss_nat.item() * batch_size
+        total_loss_adv += loss_adv.item() * batch_size
+        total_samples += batch_size
+        
+        if use_adv:
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'nat': f'{loss_nat.item():.4f}',
+                'adv': f'{loss_adv.item():.4f}'
+            })
+        else:
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-    return total_loss / total_samples
+    return {
+        'loss': total_loss / total_samples,
+        'loss_nat': total_loss_nat / total_samples,
+        'loss_adv': total_loss_adv / total_samples,
+    }
 
 
 def evaluate(model, dataloader, device):
@@ -383,7 +544,7 @@ def evaluate(model, dataloader, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='T-KAN 端到端分类器训练')
+    parser = argparse.ArgumentParser(description='T-KAN 端到端分类器训练（Mixup + 对抗训练 + Focal Loss）')
     parser.add_argument('--data_dir', type=str, default='../2026train_set/2026train_set')
     parser.add_argument('--output_dir', type=str, default='output_tkan_classifier')
     parser.add_argument('--hidden_dim', type=int, default=256)
@@ -398,10 +559,21 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use_weights', action='store_true', help='使用收益加权')
     parser.add_argument('--patience', type=int, default=5, help='早停耐心值')
-    parser.add_argument('--label_smoothing', type=float, default=0.1, help='标签平滑系数')
-    parser.add_argument('--augment', action='store_true', help='启用数据增强')
-    parser.add_argument('--noise_scale', type=float, default=0.02, help='数据增强噪声强度')
     parser.add_argument('--warmup_epochs', type=int, default=5, help='学习率预热轮数')
+    
+    # Mixup 参数
+    parser.add_argument('--use_mixup', action='store_true', help='启用 Mixup 数据增强')
+    parser.add_argument('--mixup_alpha', type=float, default=0.2, help='Mixup Beta 分布参数')
+    
+    # 对抗训练参数
+    parser.add_argument('--use_adv', action='store_true', help='启用对抗训练')
+    parser.add_argument('--adv_epsilon', type=float, default=0.01, help='对抗扰动强度')
+    
+    # Focal Loss 参数
+    parser.add_argument('--use_focal', action='store_true', help='使用 Focal Loss')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal Loss 聚焦参数')
+    parser.add_argument('--focal_alpha', type=float, nargs=3, default=[0.43, 0.14, 0.43],
+                        help='Focal Loss 类别权重 (下跌, 不变, 上涨)')
 
     args = parser.parse_args()
 
@@ -448,11 +620,9 @@ def main():
     train_dataset = StockDataset(
         sequences[train_idx], labels[train_idx], 
         returns[train_idx] if args.use_weights else None,
-        sample_weights[train_idx] if args.use_weights else None,
-        augment=args.augment,
-        noise_scale=args.noise_scale
+        sample_weights[train_idx] if args.use_weights else None
     )
-    val_dataset = StockDataset(sequences[val_idx], labels[val_idx], augment=False)
+    val_dataset = StockDataset(sequences[val_idx], labels[val_idx])
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -479,8 +649,17 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型参数量: {num_params:,}")
 
-    # 损失函数和优化器
-    criterion = LabelSmoothingCrossEntropy(smoothing=args.label_smoothing)
+    # 损失函数
+    if args.use_focal:
+        criterion = FocalLoss(
+            alpha=args.focal_alpha,
+            gamma=args.focal_gamma,
+            reduction='mean'
+        )
+        print(f"使用 Focal Loss: gamma={args.focal_gamma}, alpha={args.focal_alpha}")
+    else:
+        criterion = nn.CrossEntropyLoss()
+        print("使用标准交叉熵损失")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
@@ -497,18 +676,24 @@ def main():
     # 训练
     print("\n" + "=" * 80)
     print("开始训练")
-    print(f"配置：dropout={args.dropout}, weight_decay={args.weight_decay}, "
-          f"label_smoothing={args.label_smoothing}, augment={args.augment}")
+    print(f"配置：dropout={args.dropout}, weight_decay={args.weight_decay}")
+    print(f"Mixup: {args.use_mixup} (alpha={args.mixup_alpha if args.use_mixup else 'N/A'})")
+    print(f"对抗训练: {args.use_adv} (epsilon={args.adv_epsilon if args.use_adv else 'N/A'})")
+    print(f"Focal Loss: {args.use_focal} (gamma={args.focal_gamma if args.use_focal else 'N/A'})")
     print("=" * 80)
 
     best_acc = 0.0
     best_epoch = 0
     no_improve_count = 0
-    min_loss = float('inf')
 
     for epoch in range(args.epochs):
-        train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, device, args.use_weights
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, criterion, device,
+            use_mixup=args.use_mixup,
+            mixup_alpha=args.mixup_alpha,
+            use_adv=args.use_adv,
+            adv_epsilon=args.adv_epsilon,
+            use_weights=args.use_weights
         )
         scheduler.step()
 
@@ -517,10 +702,16 @@ def main():
         avg_acc = np.mean(list(accuracies.values()))
         current_lr = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {epoch + 1}/{args.epochs} - "
-              f"Train Loss: {train_loss:.4f}, "
-              f"Val Acc: {avg_acc:.4f}, "
-              f"LR: {current_lr:.6f}")
+        # 打印训练信息
+        if args.use_adv:
+            print(f"Epoch {epoch + 1}/{args.epochs} - "
+                  f"Loss: {train_metrics['loss']:.4f} "
+                  f"(nat: {train_metrics['loss_nat']:.4f}, adv: {train_metrics['loss_adv']:.4f}), "
+                  f"Val Acc: {avg_acc:.4f}, LR: {current_lr:.6f}")
+        else:
+            print(f"Epoch {epoch + 1}/{args.epochs} - "
+                  f"Train Loss: {train_metrics['loss']:.4f}, "
+                  f"Val Acc: {avg_acc:.4f}, LR: {current_lr:.6f}")
 
         for w, acc in accuracies.items():
             print(f"  label_{w}: {acc:.4f}")
