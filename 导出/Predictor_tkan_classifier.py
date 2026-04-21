@@ -285,7 +285,16 @@ class Predictor:
         return torch.from_numpy(features).to(self.device, dtype=torch.float32)
 
     def predict(self, x: List) -> List[List[int]]:
-        """预测接口"""
+        """预测接口（支持阈值调整）
+        
+        阈值说明：
+        - 阈值越低 → 交易次数越多 → 召回率越高 → 但准确率可能下降
+        - 阈值越高 → 交易次数越少 → 召回率越低 → 但准确率可能提高
+        
+        调整建议：
+        - label_40/60 历史表现好，可以降低阈值（0.35-0.45）
+        - label_5/10 噪声大，可以提高阈值（0.55-0.65）
+        """
         features_tensor = self.preprocess(x)
 
         with torch.no_grad():
@@ -295,9 +304,43 @@ class Predictor:
             else:
                 logits = self.model(features_tensor)
 
-        preds = logits.argmax(dim=-1).cpu().numpy()
+        # ============================================================
+        # 可调参数：阈值设置
+        # 修改这里的值来调整交易频率
+        # ============================================================
+        THRESHOLDS = {
+            5: 0.55,    # label_5 阈值（短窗口，建议 0.55-0.65）
+            10: 0.55,   # label_10 阈值（短窗口，建议 0.50-0.60）
+            20: 0.50,   # label_20 阈值（中窗口，建议 0.45-0.55）
+            40: 0.45,   # label_40 阈值（长窗口，建议 0.40-0.50）← 重点调整
+            60: 0.45,   # label_60 阈值（长窗口，建议 0.40-0.50）← 重点调整
+        }
+        # ============================================================
 
-        return preds.tolist()
+        # 获取概率分布
+        probs = F.softmax(logits, dim=-1)  # (batch, num_windows, 3)
+        
+        batch_size = probs.size(0)
+        preds = []
+        
+        for i in range(batch_size):
+            window_preds = []
+            for w_idx, w in enumerate([5, 10, 20, 40, 60]):
+                p = probs[i, w_idx]  # [p_down, p_unchanged, p_up]
+                tau = THRESHOLDS[w]
+                
+                # 预测逻辑
+                if p[2] > tau:       # 涨的概率 > 阈值
+                    pred = 2
+                elif p[0] > tau:     # 跌的概率 > 阈值
+                    pred = 0
+                else:
+                    pred = 1         # 不变
+                
+                window_preds.append(pred)
+            preds.append(window_preds)
+
+        return preds
 
 
 if __name__ == '__main__':
